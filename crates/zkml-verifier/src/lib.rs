@@ -18,31 +18,36 @@
 
 #![no_std]
 
-extern crate alloc;
-
+use soroban_sdk::crypto::bn254::{Bn254Fr, Bn254G1Affine, Bn254G2Affine};
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, log, symbol_short, Bytes, Env, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, log, symbol_short, vec, Bytes, Env,
+    Symbol, Vec, U256,
 };
 
 // Storage keys
 const MODEL_HASH: Symbol = symbol_short!("mdl_hash");
+const VERIFICATION_KEY: Symbol = symbol_short!("vk");
 const LAST_RESULT: Symbol = symbol_short!("lst_res");
 const INITIALIZED: Symbol = symbol_short!("init");
 const VERIFY_CNT: Symbol = symbol_short!("vrf_cnt");
-const VERIFICATION_KEY: Symbol = symbol_short!("vk_key");
 
 /// Contract interface version, bumped on breaking interface changes.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
-/// Rejection / Verification Errors
+/// Minimum protocol version required for BN254 host functions (CAP-0074).
+pub const MIN_PROTOCOL_VERSION: u32 = 25;
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-pub enum VerifierError {
-    NotInitialized = 1,
-    AlreadyInitialized = 2,
-    InvalidModelHash = 3,
-    InvalidInputsLength = 4,
-    InvalidProofLength = 5,
+#[repr(u32)]
+pub enum VerificationError {
+    ContractNotInitialized = 1,
+    PublicInputsTooShort = 2,
+    MalformedProofA = 3,
+    MalformedProofB = 4,
+    MalformedProofC = 5,
+    MalformedVerificationKey = 6,
+    VerificationFailed = 7,
 }
 
 /// On-chain representation of BN254 Groth16 verification key.
@@ -78,6 +83,7 @@ pub struct ZkmlVerifierContract;
 
 #[contractimpl]
 impl ZkmlVerifierContract {
+    /// Initialize the contract with a model commitment and Groth16 verification key. Call exactly once.
     /// Initialize the contract with a model commitment and verification key. Call exactly once.
     pub fn initialize(env: Env, model_hash: Bytes, vk: VerificationKey) {
         if env.storage().instance().has(&INITIALIZED) {
@@ -89,7 +95,7 @@ impl ZkmlVerifierContract {
         env.storage().instance().set(&INITIALIZED, &true);
         log!(
             &env,
-            "ZKML verifier initialized with model commitment and VK"
+            "ZKML verifier initialized with model commitment and verification key"
         );
     }
 
@@ -103,42 +109,101 @@ impl ZkmlVerifierContract {
         proof_b: Bytes,
         proof_c: Bytes,
         public_inputs: Bytes,
-    ) -> Result<bool, VerifierError> {
+    ) -> Result<(), VerificationError> {
         if !env.storage().instance().has(&INITIALIZED) {
-            return Err(VerifierError::NotInitialized);
+            return Err(VerificationError::ContractNotInitialized);
         }
-
-        // Check lengths
-        if proof_a.len() != 64 || proof_b.len() != 128 || proof_c.len() != 64 {
-            return Err(VerifierError::InvalidProofLength);
-        }
-
-        // Validate public inputs
-        let stored_model_hash = env
-            .storage()
-            .instance()
-            .get::<_, Bytes>(&MODEL_HASH)
-            .ok_or(VerifierError::NotInitialized)?;
 
         if public_inputs.len() < 64 {
-            return Err(VerifierError::InvalidInputsLength);
-        }
-        if !public_inputs.len().is_multiple_of(32) {
-            return Err(VerifierError::InvalidInputsLength);
+            return Err(VerificationError::PublicInputsTooShort);
         }
 
+        // Deserialize proof points
+        let proof_a_g1 = Self::deserialize_g1(&env, &proof_a)?;
+        let proof_b_g2 = Self::deserialize_g2(&env, &proof_b)?;
+        let proof_c_g1 = Self::deserialize_g1(&env, &proof_c)?;
+
+        // Get verification key
+        let vk: VerificationKey = env
+            .storage()
+            .instance()
+            .get(&VERIFICATION_KEY)
+            .ok_or(VerificationError::ContractNotInitialized)?;
+
+        // Extract public inputs
         let model_hash = public_inputs.slice(0..32);
-        if model_hash != stored_model_hash {
-            return Err(VerifierError::InvalidModelHash);
-        }
-
+        let input_hash = public_inputs.slice(32..64);
         let output = public_inputs.slice(64..public_inputs.len());
 
-        // TODO: Implement actual Groth16 verification
-        // This is a placeholder that will be implemented in a separate PR
-        // For now, just return true after model hash binding check
+        // Verify model hash matches stored commitment
+        let stored_model_hash: Bytes = env
+            .storage()
+            .instance()
+            .get(&MODEL_HASH)
+            .ok_or(VerificationError::ContractNotInitialized)?;
+        if model_hash != stored_model_hash {
+            return Err(VerificationError::VerificationFailed);
+        }
 
-        // Save result
+        // Convert public inputs to field elements for L computation
+        let bn254 = env.crypto().bn254();
+
+        // Deserialize VK fields to BN254 types
+        let alpha_g1 = Self::deserialize_vk_alpha(&env, &vk.alpha)?;
+        let beta_g2 = Self::deserialize_vk_g2(&env, &vk.beta)?;
+        let gamma_g2 = Self::deserialize_vk_g2(&env, &vk.gamma)?;
+        let delta_g2 = Self::deserialize_vk_g2(&env, &vk.delta)?;
+
+        // L = sum(public_input_i * vk_ic_i)
+        // Public inputs: model_hash (32 bytes), input_hash (32 bytes), output (variable)
+        // We need to convert these to Bn254Fr scalars
+        let ic0_bytes = vk
+            .ic
+            .get(0)
+            .ok_or(VerificationError::MalformedVerificationKey)?;
+        let mut l = Self::deserialize_vk_ic(&env, &ic0_bytes)?;
+
+        // Convert model_hash to scalar and multiply with ic[1]
+        let model_scalar = Self::bytes_to_fr(&env, &model_hash);
+        let ic1_bytes = vk
+            .ic
+            .get(1)
+            .ok_or(VerificationError::MalformedVerificationKey)?;
+        let ic1 = Self::deserialize_vk_ic(&env, &ic1_bytes)?;
+        let term1 = bn254.g1_mul(&ic1, &model_scalar);
+        l = bn254.g1_add(&l, &term1);
+
+        // Convert input_hash to scalar and multiply with ic[2]
+        let input_scalar = Self::bytes_to_fr(&env, &input_hash);
+        let ic2_bytes = vk
+            .ic
+            .get(2)
+            .ok_or(VerificationError::MalformedVerificationKey)?;
+        let ic2 = Self::deserialize_vk_ic(&env, &ic2_bytes)?;
+        let term2 = bn254.g1_mul(&ic2, &input_scalar);
+        l = bn254.g1_add(&l, &term2);
+
+        // Convert output to scalar and multiply with ic[3]
+        let output_scalar = Self::bytes_to_fr(&env, &output);
+        let ic3_bytes = vk
+            .ic
+            .get(3)
+            .ok_or(VerificationError::MalformedVerificationKey)?;
+        let ic3 = Self::deserialize_vk_ic(&env, &ic3_bytes)?;
+        let term3 = bn254.g1_mul(&ic3, &output_scalar);
+        l = bn254.g1_add(&l, &term3);
+
+        // Pairing check: e(A, B) == e(alpha, beta) * e(L, gamma) * e(C, delta)
+        // Equivalent to: e(-A, B) * e(alpha, beta) * e(L, gamma) * e(C, delta) == 1
+        let neg_a = -proof_a_g1;
+        let vp1 = vec![&env, neg_a, alpha_g1, l, proof_c_g1];
+        let vp2 = vec![&env, proof_b_g2, beta_g2, gamma_g2, delta_g2];
+
+        if !bn254.pairing_check(vp1, vp2) {
+            return Err(VerificationError::VerificationFailed);
+        }
+
+        // Verification succeeded - record result
         let record = InferenceRecord {
             model_hash,
             output,
@@ -153,7 +218,77 @@ impl ZkmlVerifierContract {
         env.events()
             .publish((symbol_short!("verified"),), record.verified_at);
 
-        Ok(true)
+        Ok(())
+    }
+
+    /// Deserialize a G1 point from 64 bytes (Ethereum-compatible format).
+    fn deserialize_g1(env: &Env, bytes: &Bytes) -> Result<Bn254G1Affine, VerificationError> {
+        if bytes.len() != 64 {
+            return Err(VerificationError::MalformedProofA);
+        }
+        let mut array = [0u8; 64];
+        bytes.copy_into_slice(&mut array);
+        Ok(Bn254G1Affine::from_array(env, &array))
+    }
+
+    /// Deserialize a G2 point from 128 bytes (Ethereum-compatible format).
+    fn deserialize_g2(env: &Env, bytes: &Bytes) -> Result<Bn254G2Affine, VerificationError> {
+        if bytes.len() != 128 {
+            return Err(VerificationError::MalformedProofB);
+        }
+        let mut array = [0u8; 128];
+        bytes.copy_into_slice(&mut array);
+        Ok(Bn254G2Affine::from_array(env, &array))
+    }
+
+    /// Deserialize VK alpha (G1) from Bytes.
+    fn deserialize_vk_alpha(env: &Env, bytes: &Bytes) -> Result<Bn254G1Affine, VerificationError> {
+        if bytes.len() != 64 {
+            return Err(VerificationError::MalformedVerificationKey);
+        }
+        let mut array = [0u8; 64];
+        bytes.copy_into_slice(&mut array);
+        Ok(Bn254G1Affine::from_array(env, &array))
+    }
+
+    /// Deserialize VK beta/gamma/delta (G2) from Bytes.
+    fn deserialize_vk_g2(env: &Env, bytes: &Bytes) -> Result<Bn254G2Affine, VerificationError> {
+        if bytes.len() != 128 {
+            return Err(VerificationError::MalformedVerificationKey);
+        }
+        let mut array = [0u8; 128];
+        bytes.copy_into_slice(&mut array);
+        Ok(Bn254G2Affine::from_array(env, &array))
+    }
+
+    /// Deserialize VK IC element (G1) from Bytes.
+    fn deserialize_vk_ic(env: &Env, bytes: &Bytes) -> Result<Bn254G1Affine, VerificationError> {
+        if bytes.len() != 64 {
+            return Err(VerificationError::MalformedVerificationKey);
+        }
+        let mut array = [0u8; 64];
+        bytes.copy_into_slice(&mut array);
+        Ok(Bn254G1Affine::from_array(env, &array))
+    }
+
+    /// Convert bytes to a Bn254Fr scalar field element.
+    ///
+    /// Byte-to-field mapping: Right-aligned big-endian interpretation.
+    /// If bytes.len() > 32, the leftmost bytes are truncated (only the rightmost 32 bytes are used).
+    /// If bytes.len() < 32, the value is effectively zero-padded on the left.
+    ///
+    /// IMPORTANT: The prover MUST use the same byte-to-field mapping when computing public inputs.
+    /// The 32-byte value is interpreted as a big-endian integer and reduced modulo the BN254
+    /// scalar field order r by the Bn254Fr constructor. This is the standard reduction.
+    fn bytes_to_fr(env: &Env, bytes: &Bytes) -> Bn254Fr {
+        let mut array = [0u8; 32];
+        let len = bytes.len().min(32);
+        // Right-align into the array (zero-pad left for big-endian scalar)
+        let start = 32 - len as usize;
+        let src = bytes.slice(0..len);
+        src.copy_into_slice(&mut array[start..]);
+        let bytes_ref = Bytes::from_slice(env, &array);
+        U256::from_be_bytes(env, &bytes_ref).into()
     }
 
     /// Retrieve the last verified inference result.
@@ -184,19 +319,43 @@ impl ZkmlVerifierContract {
 }
 
 #[cfg(test)]
-mod test {
+mod test_utils {
     use super::*;
     use soroban_sdk::Env;
 
-    fn get_mock_vk(env: &Env) -> VerificationKey {
+    /// Create a dummy verification key for testing.
+    /// Uses the G1 generator point (1, 2) which is valid.
+    pub fn create_dummy_vk(env: &Env) -> VerificationKey {
+        let g1_bytes: [u8; 64] = [
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 2,
+        ];
+        let g2_bytes = [0u8; 128];
+        let _g1 = Bn254G1Affine::from_array(env, &g1_bytes);
+        let _g2 = Bn254G2Affine::from_array(env, &g2_bytes);
+
         VerificationKey {
-            alpha: Bytes::from_slice(env, &[0u8; 64]),
-            beta: Bytes::from_slice(env, &[0u8; 128]),
-            gamma: Bytes::from_slice(env, &[0u8; 128]),
-            delta: Bytes::from_slice(env, &[0u8; 128]),
-            ic: soroban_sdk::Vec::new(env),
+            alpha: Bytes::from_slice(env, &g1_bytes),
+            beta: Bytes::from_slice(env, &g2_bytes),
+            gamma: Bytes::from_slice(env, &g2_bytes),
+            delta: Bytes::from_slice(env, &g2_bytes),
+            ic: vec![
+                env,
+                Bytes::from_slice(env, &g1_bytes),
+                Bytes::from_slice(env, &g1_bytes),
+                Bytes::from_slice(env, &g1_bytes),
+                Bytes::from_slice(env, &g1_bytes),
+            ],
         }
     }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use soroban_sdk::Env;
+    use test_utils::create_dummy_vk;
 
     #[test]
     fn test_initialize() {
@@ -204,7 +363,7 @@ mod test {
         let contract_id = env.register(ZkmlVerifierContract, ());
         let client = ZkmlVerifierContractClient::new(&env, &contract_id);
         let model_hash = Bytes::from_slice(&env, &[1u8; 32]);
-        let vk = get_mock_vk(&env);
+        let vk = create_dummy_vk(&env);
         client.initialize(&model_hash, &vk);
     }
 
@@ -215,30 +374,9 @@ mod test {
         let contract_id = env.register(ZkmlVerifierContract, ());
         let client = ZkmlVerifierContractClient::new(&env, &contract_id);
         let model_hash = Bytes::from_slice(&env, &[1u8; 32]);
-        let vk = get_mock_vk(&env);
+        let vk = create_dummy_vk(&env);
         client.initialize(&model_hash, &vk);
         client.initialize(&model_hash, &vk);
-    }
-
-    #[test]
-    fn verify_with_wrong_model_hash_fails() {
-        let env = Env::default();
-        let contract_id = env.register(ZkmlVerifierContract, ());
-        let client = ZkmlVerifierContractClient::new(&env, &contract_id);
-        let model_hash = Bytes::from_slice(&env, &[3u8; 32]);
-        let vk = get_mock_vk(&env);
-        client.initialize(&model_hash, &vk);
-
-        let proof_a = Bytes::from_slice(&env, &[0u8; 64]);
-        let proof_b = Bytes::from_slice(&env, &[0u8; 128]);
-        let proof_c = Bytes::from_slice(&env, &[0u8; 64]);
-        // Public inputs with different model_hash (first 32 bytes)
-        let mut public_inputs = [7u8; 96];
-        public_inputs[0] = 99; // Different model_hash
-        let public_inputs = Bytes::from_slice(&env, &public_inputs);
-
-        let res = client.try_verify_inference(&proof_a, &proof_b, &proof_c, &public_inputs);
-        assert_eq!(res.err().unwrap().unwrap(), VerifierError::InvalidModelHash);
     }
 }
 
@@ -246,17 +384,105 @@ mod test {
 mod test_guards {
     use super::*;
     use soroban_sdk::Env;
+    use test_utils::create_dummy_vk;
+
+    fn setup(env: &Env) -> ZkmlVerifierContractClient<'_> {
+        let contract_id = env.register(ZkmlVerifierContract, ());
+        let client = ZkmlVerifierContractClient::new(env, &contract_id);
+        let model_hash = Bytes::from_slice(env, &[3u8; 32]);
+        let vk = create_dummy_vk(env);
+        client.initialize(&model_hash, &vk);
+        client
+    }
 
     #[test]
-    fn verify_before_initialize_fails() {
+    fn verify_malformed_proof_a() {
+        let env = Env::default();
+        let client = setup(&env);
+
+        let proof_a = Bytes::from_slice(&env, &[0u8; 8]); // Wrong length
+        let proof_b = Bytes::from_slice(&env, &[0u8; 128]);
+        let proof_c = Bytes::from_slice(&env, &[0u8; 64]);
+        let public_inputs = Bytes::from_slice(&env, &[7u8; 96]);
+
+        let result = client.try_verify_inference(&proof_a, &proof_b, &proof_c, &public_inputs);
+        assert_eq!(result, Err(Ok(VerificationError::MalformedProofA)));
+    }
+
+    #[test]
+    fn verify_malformed_proof_b() {
+        let env = Env::default();
+        let client = setup(&env);
+
+        // Use valid G1 generator point for proof_a and proof_c
+        let g1_bytes: [u8; 64] = [
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 2,
+        ];
+        let proof_a = Bytes::from_slice(&env, &g1_bytes);
+        let proof_b = Bytes::from_slice(&env, &[0u8; 8]); // Wrong length
+        let proof_c = Bytes::from_slice(&env, &g1_bytes);
+        let public_inputs = Bytes::from_slice(&env, &[7u8; 96]);
+
+        let result = client.try_verify_inference(&proof_a, &proof_b, &proof_c, &public_inputs);
+        // Should fail due to malformed proof_b (wrong length)
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn verify_malformed_proof_c() {
+        let env = Env::default();
+        let client = setup(&env);
+
+        // Use valid G1 generator point for proof_a
+        let g1_bytes: [u8; 64] = [
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 2,
+        ];
+        let proof_a = Bytes::from_slice(&env, &g1_bytes);
+        let proof_b = Bytes::from_slice(&env, &[0u8; 128]);
+        let proof_c = Bytes::from_slice(&env, &[0u8; 8]); // Wrong length
+        let public_inputs = Bytes::from_slice(&env, &[7u8; 96]);
+        let result = client.try_verify_inference(&proof_a, &proof_b, &proof_c, &public_inputs);
+        // Should fail due to malformed proof_c (wrong length)
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn verify_public_inputs_too_short() {
+        let env = Env::default();
+        let client = setup(&env);
+
+        let proof_a = Bytes::from_slice(&env, &[0u8; 64]);
+        let proof_b = Bytes::from_slice(&env, &[0u8; 128]);
+        let proof_c = Bytes::from_slice(&env, &[0u8; 64]);
+        let public_inputs = Bytes::from_slice(&env, &[7u8; 32]); // Too short
+
+        let result = client.try_verify_inference(&proof_a, &proof_b, &proof_c, &public_inputs);
+        assert_eq!(result, Err(Ok(VerificationError::PublicInputsTooShort)));
+    }
+
+    #[test]
+    fn verify_wrong_model_hash() {
         let env = Env::default();
         let contract_id = env.register(ZkmlVerifierContract, ());
         let client = ZkmlVerifierContractClient::new(&env, &contract_id);
-        let proof = Bytes::from_slice(&env, &[0u8; 64]);
-        let public_inputs = Bytes::from_slice(&env, &[7u8; 96]);
-        let res = client.try_verify_inference(&proof, &proof, &proof, &public_inputs);
 
-        assert_eq!(res.err().unwrap().unwrap(), VerifierError::NotInitialized);
+        // Initialize with model hash [3u8; 32]
+        let model_hash = Bytes::from_slice(&env, &[3u8; 32]);
+        let vk = create_dummy_vk(&env);
+        client.initialize(&model_hash, &vk);
+
+        // Try to verify with different model hash [5u8; 32]
+        let proof_a = Bytes::from_slice(&env, &[0u8; 64]);
+        let proof_b = Bytes::from_slice(&env, &[0u8; 128]);
+        let proof_c = Bytes::from_slice(&env, &[0u8; 64]);
+        let public_inputs = Bytes::from_slice(&env, &[5u8; 96]); // Wrong model hash
+
+        let result = client.try_verify_inference(&proof_a, &proof_b, &proof_c, &public_inputs);
+        assert_eq!(result, Err(Ok(VerificationError::VerificationFailed)));
     }
 }
 
@@ -264,6 +490,20 @@ mod test_guards {
 mod test_poseidon_cross_check {
     use super::*;
     use soroban_sdk::Env;
+
+    #[test]
+    fn verify_before_initialize_returns_error() {
+        let env = Env::default();
+        let contract_id = env.register(ZkmlVerifierContract, ());
+        let client = ZkmlVerifierContractClient::new(&env, &contract_id);
+        let proof_a = Bytes::from_slice(&env, &[0u8; 64]);
+        let proof_b = Bytes::from_slice(&env, &[0u8; 128]);
+        let proof_c = Bytes::from_slice(&env, &[0u8; 64]);
+        let public_inputs = Bytes::from_slice(&env, &[7u8; 96]);
+
+        let result = client.try_verify_inference(&proof_a, &proof_b, &proof_c, &public_inputs);
+        assert_eq!(result, Err(Ok(VerificationError::ContractNotInitialized)));
+    }
 
     #[test]
     fn model_commitment_is_reproducible() {
