@@ -152,18 +152,28 @@ fn fixture_tinymlp_extracts_and_matches_json() {
     let imported_onnx = import_onnx(&onnx_bytes).expect("tinymlp onnx should extract");
 
     // Load equivalent JSON model
-    let json_path = format!("{}/tests/vectors/{}", env!("CARGO_MANIFEST_DIR"), "tinymlp_golden.json");
+    let json_path = format!(
+        "{}/tests/vectors/{}",
+        env!("CARGO_MANIFEST_DIR"),
+        "tinymlp_golden.json"
+    );
     let json_bytes = std::fs::read(&json_path).expect("read json model");
     let imported_json = import_json(&json_bytes).expect("tinymlp json should import");
 
     // Check type of models and verify architecture details
     match (&imported_onnx, &imported_json) {
-        (zkml_common::models::Model::TinyMLP(mlp_onnx), zkml_common::models::Model::TinyMLP(mlp_json)) => {
+        (
+            zkml_common::models::Model::TinyMLP(mlp_onnx),
+            zkml_common::models::Model::TinyMLP(mlp_json),
+        ) => {
             assert_eq!(mlp_onnx.layers.len(), 2);
             assert_eq!(mlp_json.layers.len(), 2);
             for i in 0..2 {
                 assert_eq!(mlp_onnx.layers[i].input_size, mlp_json.layers[i].input_size);
-                assert_eq!(mlp_onnx.layers[i].output_size, mlp_json.layers[i].output_size);
+                assert_eq!(
+                    mlp_onnx.layers[i].output_size,
+                    mlp_json.layers[i].output_size
+                );
                 assert_eq!(mlp_onnx.layers[i].weights, mlp_json.layers[i].weights);
                 assert_eq!(mlp_onnx.layers[i].biases, mlp_json.layers[i].biases);
             }
@@ -186,6 +196,9 @@ fn fixture_tinymlp_extracts_and_matches_json() {
         let out_onnx = run_inference(&imported_onnx, &sample);
         let out_json = run_inference(&imported_json, &sample);
         // Assert exact matches of fixed-point outputs
-        assert_eq!(out_onnx, out_json, "Inference mismatch between ONNX and JSON");
+        assert_eq!(
+            out_onnx, out_json,
+            "Inference mismatch between ONNX and JSON"
+        );
     }
 }

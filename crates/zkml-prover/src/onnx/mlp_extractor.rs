@@ -12,6 +12,8 @@
 //! Activation between layers must be `Relu`. The final layer may omit the
 //! activation (raw logits), following the project convention.
 
+#![allow(clippy::manual_is_multiple_of)]
+
 use std::collections::HashMap;
 
 use super::error::OnnxImportError;
@@ -425,7 +427,11 @@ pub fn extract_mlp(graph: &GraphProto) -> Result<TinyMLP, OnnxImportError> {
     let layers: Vec<DenseLayer> = raw_layers
         .into_iter()
         .map(|rl| DenseLayer {
-            weights: rl.weights.iter().map(|&w| FixedPoint::quantize(w)).collect(),
+            weights: rl
+                .weights
+                .iter()
+                .map(|&w| FixedPoint::quantize(w))
+                .collect(),
             biases: rl.biases.iter().map(|&b| FixedPoint::quantize(b)).collect(),
             input_size: rl.input_size,
             output_size: rl.output_size,
@@ -433,9 +439,8 @@ pub fn extract_mlp(graph: &GraphProto) -> Result<TinyMLP, OnnxImportError> {
         .collect();
 
     let mlp = TinyMLP { layers };
-    mlp.validate().map_err(|e| {
-        OnnxImportError::MalformedModel(format!("MLP validation failed: {e}"))
-    })?;
+    mlp.validate()
+        .map_err(|e| OnnxImportError::MalformedModel(format!("MLP validation failed: {e}")))?;
 
     Ok(mlp)
 }
@@ -573,9 +578,7 @@ mod tests {
         };
 
         let err = extract_mlp(&graph).unwrap_err();
-        assert!(
-            matches!(err, OnnxImportError::MalformedModel(msg) if msg.contains("Softmax"))
-        );
+        assert!(matches!(err, OnnxImportError::MalformedModel(msg) if msg.contains("Softmax")));
     }
 
     #[test]

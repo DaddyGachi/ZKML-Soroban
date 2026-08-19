@@ -142,15 +142,14 @@ pub fn import_onnx(bytes: &[u8]) -> Result<Model, OnnxImportError> {
     let architecture = detect_architecture(&model);
 
     // Check if this is an MLP-shaped graph (contains Gemm, MatMul, Add, Relu only)
-    let is_mlp = graph.node.iter().all(|n| {
-        matches!(
-            n.op_type.as_str(),
-            "Gemm" | "MatMul" | "Add" | "Relu"
-        )
-    }) && graph
+    let is_mlp = graph
         .node
         .iter()
-        .any(|n| matches!(n.op_type.as_str(), "Gemm" | "MatMul"));
+        .all(|n| matches!(n.op_type.as_str(), "Gemm" | "MatMul" | "Add" | "Relu"))
+        && graph
+            .node
+            .iter()
+            .any(|n| matches!(n.op_type.as_str(), "Gemm" | "MatMul"));
 
     if is_mlp {
         let mlp = mlp_extractor::extract_mlp(graph)?;
