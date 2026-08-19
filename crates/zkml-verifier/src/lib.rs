@@ -151,6 +151,8 @@ impl ZkmlVerifierContract {
         let gamma_g2 = Self::deserialize_vk_g2(&env, &vk.gamma)?;
         let delta_g2 = Self::deserialize_vk_g2(&env, &vk.delta)?;
 
+        // L = sum(public_input_i * vk_ic_i)
+        // Note: In Groth16, IC[0] is the constant term, and public inputs start at index 1
         // Compute L = ic[0] + sum(scalar_i * ic[i]) using generic loop
         let l = Self::compute_l(&env, &vk, &parsed_inputs)?;
 
