@@ -3,8 +3,6 @@
 //! Used to commit to a model whose parameters are chunked into leaves, so an
 //! individual chunk can later be opened without revealing the whole model.
 
-#![allow(clippy::manual_is_multiple_of, clippy::assign_op_pattern, clippy::redundant_closure)]
-
 use crate::commitment::{commit_i64, Commitment};
 
 #[cfg(not(feature = "std"))]
