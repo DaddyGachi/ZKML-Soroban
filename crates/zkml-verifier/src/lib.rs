@@ -758,14 +758,6 @@ mod test_admin_auth {
     use soroban_sdk::Env;
     use test_utils::create_dummy_vk;
 
-    // Note on unauthorized access testing:
-    // In Soroban's test environment, mock_all_auths() persists for the entire test
-    // and there is no straightforward way to clear it or test unauthorized paths
-    // in unit tests. The auth gate (admin.require_auth()) is enforced by the
-    // Soroban runtime in production. The tests below verify that the admin functions
-    // work correctly when proper authorization is provided. The actual rejection
-    // of unauthorized callers is guaranteed by the Soroban runtime's auth system.
-
     fn setup_with_admin(env: &Env) -> (ZkmlVerifierContractClient<'_>, Address) {
         let contract_id = env.register(ZkmlVerifierContract, ());
         let client = ZkmlVerifierContractClient::new(env, &contract_id);
@@ -825,6 +817,28 @@ mod test_admin_auth {
     }
 
     #[test]
+    fn set_verification_key_unauthorized_fails() {
+        let env = Env::default();
+        let contract_id = env.register(ZkmlVerifierContract, ());
+        let client = ZkmlVerifierContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let model_hash = Bytes::from_slice(&env, &[3u8; 32]);
+        let vk = create_dummy_vk(&env, 4);
+
+        // Initialize with auth
+        env.mock_all_auths();
+        client.initialize(&admin, &model_hash, &vk);
+
+        // Clear auth to test unauthorized access
+        env.mock_auths(&[]);
+
+        // Try to set VK without auth - should fail
+        let new_vk = create_dummy_vk(&env, 5);
+        let result = client.try_set_verification_key(&new_vk);
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn set_model_hash_authorized_succeeds() {
         let env = Env::default();
         let (client, _admin) = setup_with_admin(&env);
@@ -837,6 +851,28 @@ mod test_admin_auth {
         // Verify model hash was updated
         let stored_model_hash = client.get_model_hash();
         assert_eq!(stored_model_hash, new_model_hash);
+    }
+
+    #[test]
+    fn set_model_hash_unauthorized_fails() {
+        let env = Env::default();
+        let contract_id = env.register(ZkmlVerifierContract, ());
+        let client = ZkmlVerifierContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let model_hash = Bytes::from_slice(&env, &[3u8; 32]);
+        let vk = create_dummy_vk(&env, 4);
+
+        // Initialize with auth
+        env.mock_all_auths();
+        client.initialize(&admin, &model_hash, &vk);
+
+        // Clear auth to test unauthorized access
+        env.mock_auths(&[]);
+
+        // Try to set model hash without auth - should fail
+        let new_model_hash = Bytes::from_slice(&env, &[5u8; 32]);
+        let result = client.try_set_model_hash(&new_model_hash);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -855,6 +891,28 @@ mod test_admin_auth {
     }
 
     #[test]
+    fn set_admin_unauthorized_fails() {
+        let env = Env::default();
+        let contract_id = env.register(ZkmlVerifierContract, ());
+        let client = ZkmlVerifierContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let model_hash = Bytes::from_slice(&env, &[3u8; 32]);
+        let vk = create_dummy_vk(&env, 4);
+
+        // Initialize with auth
+        env.mock_all_auths();
+        client.initialize(&admin, &model_hash, &vk);
+
+        // Clear auth to test unauthorized access
+        env.mock_auths(&[]);
+
+        // Try to set admin without auth - should fail
+        let new_admin = Address::generate(&env);
+        let result = client.try_set_admin(&new_admin);
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn set_pause_authorized_succeeds() {
         let env = Env::default();
         let (client, _admin) = setup_with_admin(&env);
@@ -869,6 +927,27 @@ mod test_admin_auth {
         // Unpause
         client.set_pause(&false);
         assert!(!client.is_paused());
+    }
+
+    #[test]
+    fn set_pause_unauthorized_fails() {
+        let env = Env::default();
+        let contract_id = env.register(ZkmlVerifierContract, ());
+        let client = ZkmlVerifierContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let model_hash = Bytes::from_slice(&env, &[3u8; 32]);
+        let vk = create_dummy_vk(&env, 4);
+
+        // Initialize with auth
+        env.mock_all_auths();
+        client.initialize(&admin, &model_hash, &vk);
+
+        // Clear auth to test unauthorized access
+        env.mock_auths(&[]);
+
+        // Try to set pause without auth - should fail
+        let result = client.try_set_pause(&true);
+        assert!(result.is_err());
     }
 
     #[test]
