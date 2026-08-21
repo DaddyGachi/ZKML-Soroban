@@ -33,6 +33,17 @@ const VERIFY_CNT: Symbol = symbol_short!("vrf_cnt");
 const ADMIN: Symbol = symbol_short!("admin");
 const PAUSED: Symbol = symbol_short!("paused");
 
+/// Ledgers per day on Stellar (~5s per ledger).
+const DAY_IN_LEDGERS: u32 = 17_280;
+
+/// Renew instance TTL when remaining lifetime falls below 30 days.
+/// A verifier used at least monthly stays live without an external keeper.
+const INSTANCE_TTL_THRESHOLD: u32 = 30 * DAY_IN_LEDGERS;
+
+/// Extend instance TTL to 120 days when the threshold is crossed.
+/// Matches the typical persistent rent floor and stays under the ~180-day network max.
+const INSTANCE_TTL_EXTEND_TO: u32 = 120 * DAY_IN_LEDGERS;
+
 /// Contract interface version, bumped on breaking interface changes.
 pub const VERSION: u32 = 2;
 
@@ -100,6 +111,7 @@ impl ZkmlVerifierContract {
         env.storage().instance().set(&VERIFY_CNT, &0u32);
         env.storage().instance().set(&PAUSED, &false);
         env.storage().instance().set(&INITIALIZED, &true);
+        Self::bump_instance_ttl(&env);
         log!(
             &env,
             "ZKML verifier initialized with model commitment and verification key"
@@ -189,12 +201,23 @@ impl ZkmlVerifierContract {
 
         let count: u32 = env.storage().instance().get(&VERIFY_CNT).unwrap_or(0);
         env.storage().instance().set(&VERIFY_CNT, &(count + 1));
+        Self::bump_instance_ttl(&env);
 
         #[allow(deprecated)]
         env.events()
             .publish((symbol_short!("verified"),), record.verified_at);
 
         Ok(())
+    }
+
+    /// Renew instance storage TTL when remaining lifetime is below the threshold.
+    ///
+    /// `extend_ttl` is a no-op unless the current TTL is below
+    /// [`INSTANCE_TTL_THRESHOLD`]; then it is set to [`INSTANCE_TTL_EXTEND_TO`].
+    fn bump_instance_ttl(env: &Env) {
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
     }
 
     /// Deserialize a G1 point from 64 bytes (Ethereum-compatible format).
